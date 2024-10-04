@@ -12,6 +12,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+
 // Function to calculate cost based on token usage
 function calculateCost(inputTokens, outputTokens) {
   const inputCost = (inputTokens / 1000) * 0.03;
@@ -20,14 +21,45 @@ function calculateCost(inputTokens, outputTokens) {
 }
 
 function cleanAndParseJSON(content) {
-  // Remove any text before the first '{' and after the last '}'
-  const jsonString = content.substring(content.indexOf('{'), content.lastIndexOf('}') + 1);
   try {
+    // Remove any leading or trailing whitespace
+    content = content.trim();
+    
+    // Check if the content is already a valid JSON
+    try {
+      return JSON.parse(content);
+    } catch (e) {
+      // If it's not valid JSON, continue with cleaning
+    }
+
+    // Find the first '[' or '{' and the last ']' or '}'
+    const start = content.indexOf('{') !== -1 ? content.indexOf('{') : content.indexOf('[');
+    const end = content.lastIndexOf('}') !== -1 ? content.lastIndexOf('}') + 1 : content.lastIndexOf(']') + 1;
+    
+    if (start === -1 || end === -1) {
+      throw new Error('No valid JSON object or array found');
+    }
+    
+    const jsonString = content.slice(start, end);
     return JSON.parse(jsonString);
   } catch (error) {
     console.error('Error parsing JSON:', error);
+    console.error('Problematic content:', content);
     return null;
   }
+}
+
+async function processBatch(ideas, batchSize = 5, writeProgress) {
+  const results = [];
+  for (let i = 0; i < ideas.length; i += batchSize) {
+    const batch = ideas.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(({ idea, link }) => generateBlogPost(idea, link)));
+    results.push(...batchResults);
+    if (writeProgress) {
+      await writeProgress(`Processed ${Math.min(i + batchSize, ideas.length)} of ${ideas.length} ideas`);
+    }
+  }
+  return results;
 }
 
 export async function POST(req) {
@@ -54,46 +86,21 @@ export async function POST(req) {
       const workbook = new ExcelJS.Workbook();
       await workbook.xlsx.load(buffer);
 
-      const worksheet = workbook.worksheets[0];
-      if (!worksheet) {
-        throw new Error('Invalid Excel file: No worksheet found');
-      }
-
+      const worksheet = workbook.getWorksheet(1);
       const ideas = [];
+
       worksheet.eachRow((row, rowNumber) => {
-        if (rowNumber === 1) return;
+        if (rowNumber === 1) return; // Skip header row
         const idea = row.getCell(1).value;
+        const link = row.getCell(2).value;
         if (idea) {
-          ideas.push(idea);
+          ideas.push({ idea, link });
         }
       });
 
       await writeProgress(`Extracted ${ideas.length} ideas from the Excel file`);
 
-      const results = [];
-      for (let i = 0; i < ideas.length; i++) {
-        const idea = ideas[i];
-        try {
-          await writeProgress(`Generating blog post ${i + 1} of ${ideas.length}...`);
-          const blogPost = await generateBlogPost(idea);
-          results.push(blogPost);
-          if (blogPost.content.includes("[Content generation failed")) {
-            await writeProgress(`Blog post ${i + 1} generated with some failed sections (${blogPost.content.split(/\s+/).length} words, cost: $${blogPost.cost})`);
-          } else {
-            await writeProgress(`Blog post ${i + 1} generated successfully (${blogPost.content.split(/\s+/).length} words, cost: $${blogPost.cost})`);
-          }
-        } catch (error) {
-          console.error('Error generating blog post for idea:', idea, error);
-          results.push({
-            title: `Error: ${idea}`,
-            date: new Date().toISOString().split('T')[0],
-            slug: generateSlug(`Error for ${idea}`),
-            content: `Failed to generate content. Error: ${error.message}`,
-            cost: 0
-          });
-          await writeProgress(`Error generating blog post ${i + 1}: ${error.message}`);
-        }
-      }
+      const results = await processBatch(ideas, 5, writeProgress);
 
       const outputWorkbook = new ExcelJS.Workbook();
       const outputWorksheet = outputWorkbook.addWorksheet('Blog Posts');
@@ -135,20 +142,32 @@ export async function POST(req) {
   });
 }
 
-async function generateBlogPost(idea) {
+async function generateBlogPost(idea, link) {
   try {
-    const outline = await generateOutline(idea);
-    const sections = await Promise.all(outline.sections.map(section => generateSection(section, idea)));
-    const sources = await generateSources(idea);
+    const outline = await generateOutline(idea, link);
+    const sections = await Promise.all(outline.sections.map(section => generateSection(section, idea, link)));
+    const sources = await generateSources(idea, link);
 
-    const content = sections.map(section => section.content).join('\n\n');
+    // Remove "Section" prefix from headings
+    const cleanedSections = sections.map(section => {
+      const heading = section.content.split('\n')[0];
+      const cleanedHeading = heading.replace(/^#+\s*(?:Section\s*\d+:\s*)?/i, '');
+      const content = section.content.replace(heading, `## ${cleanedHeading}`);
+      return { ...section, content };
+    });
+
+    const content = cleanedSections.map(section => section.content).join('\n\n');
+    
+    // Remove null links
+    const cleanedContent = content.replace(/\[([^\]]+)\]\(null\)/g, '$1');
+
     const totalTokens = sections.reduce((sum, section) => sum + section.tokens, 0);
 
     const blogPost = {
       title: outline.title,
       date: new Date().toISOString().split('T')[0],
       slug: generateSlug(outline.title),
-      content: content,
+      content: cleanedContent,
       sources: sources,
       cost: calculateCost(totalTokens, totalTokens)
     };
@@ -167,48 +186,51 @@ async function generateBlogPost(idea) {
   }
 }
 
-async function generateOutline(idea) {
+async function generateOutline(idea, link) {
   const outlinePrompt = `
 Create a detailed outline for a 2,000-3,000 word blog post on the following topic:
 "${idea}"
+
+Reference link for additional information: ${link}
+
 Provide the outline in the following JSON format:
 {
   "title": "SEO-optimized blog post title",
   "sections": [
-    {"heading": "Introduction", "subheadings": ["subheading1", "subheading2"]},
-    {"heading": "Main Point 1", "subheadings": ["subheading1", "subheading2"]},
-    {"heading": "Main Point 2", "subheadings": ["subheading1", "subheading2"]},
-    {"heading": "Main Point 3", "subheadings": ["subheading1", "subheading2"]},
-    {"heading": "Conclusion", "subheadings": ["subheading1", "subheading2"]}
-  ]
-}`;
+    {"heading": "Introduction", "subheadings": []},
+    {"heading": "Section 1", "subheadings": []},
+    {"heading": "Section 2", "subheadings": []},
+    {"heading": "Section 3", "subheadings": []},
+    {"heading": "Conclusion", "subheadings": []}
+  ]}`;
 
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4',
       messages: [{ role: 'user', content: outlinePrompt }],
-      max_tokens: 500,
+      max_tokens: 1000,
       temperature: 0.7,
     });
 
     const content = completion.choices[0].message.content;
-    const parsedOutline = cleanAndParseJSON(content);
-    
-    if (parsedOutline) {
+    console.log('Raw outline response:', content);
+    const parsedOutline = cleanAndParseJSON(content);    
+
+    if (parsedOutline && parsedOutline.title && Array.isArray(parsedOutline.sections)) {
       return parsedOutline;
     } else {
-      throw new Error('Failed to parse outline JSON');
+      throw new Error('Invalid outline format');
     }
   } catch (error) {
     console.error('Error generating outline:', error);
     return {
-      title: `Outline for: ${idea}`,
+      title: `${idea}`,
       sections: [
-        { heading: "Introduction", subheadings: ["Context", "Thesis"] },
-        { heading: "Main Point 1", subheadings: ["Explanation", "Example"] },
-        { heading: "Main Point 2", subheadings: ["Explanation", "Example"] },
-        { heading: "Main Point 3", subheadings: ["Explanation", "Example"] },
-        { heading: "Conclusion", subheadings: ["Summary", "Call to Action"] }
+        { heading: "Introduction", subheadings: [] },
+        { heading: "Section 1", subheadings: [] },
+        { heading: "Section 2", subheadings: [] },
+        { heading: "Section 3", subheadings: [] },
+        { heading: "Conclusion", subheadings: [] }
       ]
     };
   }
@@ -227,29 +249,30 @@ Provide at least 200 words of content for this section.`
   return sectionResults;
 }
 
-async function generateSection(sectionPrompt, idea, retries = 3) {
+async function generateSection(sectionPrompt, idea, link, retries = 3) {
   const isIntroduction = sectionPrompt.heading === "Introduction";
-  const prompt = isIntroduction
-    ? `Write an engaging introduction for a blog post about "${idea}". Include context and a clear thesis statement. Aim for at least 150 words.`
-    : `Write a detailed section for a blog post about "${idea}":
-Heading: ${sectionPrompt.heading}
-Subheadings: ${sectionPrompt.subheadings.join(', ')}
-Provide at least 200 words of content for this section.`;
+  const isConclusion = sectionPrompt.heading === "Conclusion";
+  const prompt = `Write a detailed ${sectionPrompt.heading.toLowerCase()} for a blog post about "${idea}". 
+  ${isIntroduction ? "Include context and a clear thesis statement." : ""}
+  ${isConclusion ? "Summarize the main points and provide a call to action or final thoughts." : ""}
+  Aim for at least ${isIntroduction || isConclusion ? "150" : "300"} words. 
+  Integrate relevant links using markdown format. 
+  Reference link for additional information: ${link}`;
 
   while (retries > 0) {
     try {
       const completion = await openai.chat.completions.create({
         model: 'gpt-4',
         messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1000,
+        max_tokens: 1500,
         temperature: 0.7,
       });
 
       const content = completion.choices[0].message.content;
       const wordCount = content.split(/\s+/).length;
 
-      if ((isIntroduction && wordCount >= 150) || (!isIntroduction && wordCount >= 200)) {
-        return { content: `## ${sectionPrompt.heading}\n\n${content}`, tokens: completion.usage.total_tokens };
+      if ((isIntroduction && wordCount >= 150) || (isConclusion && wordCount >= 150) || (!isIntroduction && !isConclusion && wordCount >= 300)) {
+        return { content: `${content}`, tokens: completion.usage.total_tokens };
       }
 
       console.log(`Retry for section ${sectionPrompt.heading}: Word count (${wordCount}) too low.`);
@@ -261,15 +284,14 @@ Provide at least 200 words of content for this section.`;
   }
 
   // If all retries fail, return a default content
-  const defaultContent = isIntroduction
-    ? `## Introduction\n\n[This is a placeholder introduction for the blog post about "${idea}". Please replace this with a proper introduction of at least 150 words, providing context and a clear thesis statement.]`
-    : `## ${sectionPrompt.heading}\n\n[Content generation failed for this section. Please replace this with your own content of at least 200 words, covering the following subheadings: ${sectionPrompt.subheadings.join(', ')}]`;
+  const defaultContent = `[Content generation failed for the ${sectionPrompt.heading.toLowerCase()}. Please replace this with your own content of at least ${isIntroduction || isConclusion ? "150" : "300"} words.]`;
   
   return { content: defaultContent, tokens: defaultContent.split(/\s+/).length };
 }
 
-async function generateSources(idea) {
+async function generateSources(idea, link) {
   const sourcesPrompt = `Provide a list of 3-5 reputable sources for a blog post about "${idea}".
+  Reference link for additional information: ${link}
   Return the sources in the following JSON format:
   [{"name": "Source Name", "link": "https://source-link.com"}]`;
 
@@ -282,16 +304,20 @@ async function generateSources(idea) {
     });
 
     const content = completion.choices[0].message.content;
-    const parsedSources = cleanAndParseJSON(content);
-    
-    if (parsedSources) {
+    console.log('Raw sources response:', content);
+    const parsedSources = cleanAndParseJSON(content);    
+
+    if (parsedSources && Array.isArray(parsedSources)) {
       return parsedSources;
     } else {
-      throw new Error('Failed to parse sources JSON');
+      console.error('Invalid sources format:', parsedSources);
+      // If parsing fails, try to extract URLs from the content
+      const urls = content.match(/https?:\/\/[^\s]+/g) || [];
+      return urls.map(url => ({ name: "Source", link: url }));
     }
   } catch (error) {
     console.error('Error generating sources:', error);
-    return [];
+    return []; // Return an empty array on error
   }
 }
 
