@@ -100,7 +100,7 @@ export default function Home() {
             {isDragActive ? (
               <p>Drop the Excel file here ...</p>
             ) : (
-              <p>Drag 'n' drop an Excel file here, or click to select one</p>
+              <p>Drag &apos;n&apos; drop an Excel file here, or click to select one</p>
             )}
           </div>
           {file && (
