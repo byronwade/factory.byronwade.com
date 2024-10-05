@@ -1,33 +1,9 @@
-import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Progress } from "@/components/ui/progress"
-import { Loader2, CheckCircle2, AlertCircle } from 'lucide-react'
+import { Loader2, CheckCircle2 } from 'lucide-react'
 
-export default function ProgressDisplay({ isProcessing, progressSteps }) {
-  const [progress, setProgress] = useState(0)
-
-  useEffect(() => {
-    if (isProcessing) {
-      const timer = setInterval(() => {
-        setProgress((oldProgress) => {
-          const newProgress = Math.min(oldProgress + 1, 100)
-          if (newProgress === 100) {
-            clearInterval(timer)
-          }
-          return newProgress
-        })
-      }, 500)
-
-      return () => {
-        clearInterval(timer)
-      }
-    } else {
-      setProgress(0)
-    }
-  }, [isProcessing])
-
-  if (!isProcessing && (!progressSteps || progressSteps.length === 0)) {
-    return null
+export default function ProgressDisplay({ isProcessing, generationProgress, onCancel }) {
+  if (!isProcessing && (!generationProgress || generationProgress.length === 0)) {
+    return null;
   }
 
   return (
@@ -40,24 +16,38 @@ export default function ProgressDisplay({ isProcessing, progressSteps }) {
             <CheckCircle2 className="w-4 h-4 mr-2 text-green-500" />
           )}
           Generation Progress
+          
+        {isProcessing && (
+          <div className="mt-4 text-center">
+            <a
+              href="#"
+              onClick={(e) => {
+                e.preventDefault();
+                onCancel();
+              }}
+              className="text-sm text-red-500 hover:text-red-700"
+            >
+              Cancel Process
+            </a>
+          </div>
+        )}
         </CardTitle>
       </CardHeader>
       <CardContent>
-        <Progress value={progress} className="mb-4" />
         <div className="space-y-4">
-          {progressSteps && progressSteps.map((step, index) => (
+          {generationProgress.map((item, index) => (
             <div key={index} className="flex items-start">
-              {step.status === 'pending' && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              {step.status === 'complete' && <CheckCircle2 className="w-4 h-4 mr-2 text-green-500" />}
-              {step.status === 'error' && <AlertCircle className="w-4 h-4 mr-2 text-red-500" />}
+              {item.status === 'processing' ? (
+                <Loader2 className="w-4 h-4 mr-2 text-blue-500 animate-spin" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4 mr-2 text-green-500" />
+              )}
               <div className="flex-1">
-                <p className="text-sm font-medium">{step.message}</p>
-                {step.details && (
-                  <p className="text-xs text-gray-500">
-                    {step.details.wordCount && `${step.details.wordCount} words`}
-                    {step.details.wordCount && step.details.cost && ', '}
-                    {step.details.cost && `cost: $${step.details.cost.toFixed(4)}`}
-                  </p>
+                <p className="text-sm font-medium">
+                  {item.status === 'processing' ? item.idea : item.title}
+                </p>
+                {item.status === 'completed' && (
+                  <p className="text-xs text-gray-500">Completed</p>
                 )}
               </div>
             </div>
@@ -65,5 +55,5 @@ export default function ProgressDisplay({ isProcessing, progressSteps }) {
         </div>
       </CardContent>
     </Card>
-  )
+  );
 }

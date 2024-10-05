@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useRef } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -14,6 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Download, Upload, FileSpreadsheet, FileText, Plus, Sun, Moon, Laptop } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import ProgressDisplay from './progress-display'
@@ -27,6 +28,9 @@ export default function Home() {
   const [csvContent, setCsvContent] = useState('')
   const [singlePost, setSinglePost] = useState({ title: '', link: '', image: null })
   const [theme, setTheme] = useState('system')
+  const [exportFormat, setExportFormat] = useState('excel')
+  const [isProcessing, setIsProcessing] = useState(false)
+  const abortControllerRef = useRef(null)
 
   const onDrop = useCallback((acceptedFiles) => {
     setFile(acceptedFiles[0])
@@ -43,39 +47,188 @@ export default function Home() {
     }
   })
 
-  const handleUpload = async () => {
-    if (!file && !csvContent && !singlePost.title) {
-      setError('Please provide input data before processing')
-      return
+  const handleUpload = async (file, exportFormat) => {
+    setIsUploading(true);
+    setGenerationProgress([]);
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('exportFormat', exportFormat);
+
+    try {
+      const response = await fetch('/api/process-excel', {
+        method: 'POST',
+        body: formData
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('PROGRESS:')) {
+            const progressMessage = line.slice(9);
+            setGenerationProgress(prev => [...prev, { message: progressMessage, status: 'info' }]);
+          } else if (line.startsWith('GOOGLE_SHEETS:')) {
+            const googleSheetsData = JSON.parse(line.slice(14));
+            setGenerationProgress(prev => [
+              ...prev,
+              { message: googleSheetsData.message, status: 'complete' },
+              { message: `<a href="${googleSheetsData.url}" target="_blank" rel="noopener noreferrer">Open Google Sheets</a>`, status: 'complete', isHtml: true }
+            ]);
+          } else if (line.startsWith('ERROR:')) {
+            const errorMessage = line.slice(6);
+            setGenerationProgress(prev => [...prev, { message: `Error: ${errorMessage}`, status: 'error' }]);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error during upload:', error);
+      setGenerationProgress(prev => [...prev, { message: `Error: ${error.message}`, status: 'error' }]);
+    } finally {
+      setIsUploading(false);
     }
-
-    setIsUploading(true)
-    setError(null)
-    setGenerationProgress([])
-
-    // Simulating API call and progress updates
-    for (let i = 0; i < 5; i++) {
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      setGenerationProgress(prev => [...prev, {
-        message: `Processing step ${i + 1}`,
-        status: 'pending',
-        details: { wordCount: Math.floor(Math.random() * 100), cost: Math.random() * 0.1 }
-      }])
-    }
-
-    setGenerationProgress(prev => [...prev, { message: 'Processing complete!', status: 'complete' }])
-    setIsUploading(false)
-  }
+  };
 
   const handleDownload = async () => {
     setIsLoading(true)
-    await new Promise(resolve => setTimeout(resolve, 2000))
-    setIsLoading(false)
+    try {
+      const response = await fetch('/api/generate-example', {
+        method: 'GET',
+      })
+
+      if (!response.ok) {
+        throw new Error('Failed to generate example file')
+      }
+
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'blog_ideas_example.xlsx'
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      console.error('Error downloading example file:', error)
+      setError('Failed to download example file')
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   const handleThemeChange = (newTheme) => {
     setTheme(newTheme)
   }
+
+  const getContentType = (filename) => {
+    const extension = filename.split('.').pop().toLowerCase()
+    switch (extension) {
+      case 'xlsx':
+        return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      case 'csv':
+        return 'text/csv'
+      case 'json':
+        return 'application/json'
+      case 'md':
+        return 'text/markdown'
+      case 'zip':
+        return 'application/zip'
+      default:
+        return 'application/octet-stream'
+    }
+  }
+
+  const handleCancel = async () => {
+    try {
+      const response = await fetch('/api/cancel-process', { method: 'POST' })
+      if (!response.ok) {
+        throw new Error('Failed to cancel the process')
+      }
+      setError('Process cancelled')
+      setIsProcessing(false)
+      setIsUploading(false)
+      setFile(null)
+      setCsvContent('')
+      setSinglePost({ title: '', link: '', image: null })
+      setGenerationProgress([])
+    } catch (error) {
+      console.error('Error cancelling process:', error)
+    }
+  }
+
+  const handleServerSentEvents = async (response) => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (line.startsWith('PROGRESS:')) {
+          console.log('Received progress update:', line);
+          const progressMessage = line.slice(9);
+          if (progressMessage.startsWith('PROCESSING:')) {
+            const idea = progressMessage.slice(11);
+            setGenerationProgress(prev => [...prev, { message: `Processing: ${idea}`, status: 'processing' }]);
+          } else if (progressMessage.startsWith('COMPLETED:')) {
+            const [idea, title] = progressMessage.slice(10).split(':');
+            setGenerationProgress(prev => 
+              prev.map(item => 
+                item.message === `Processing: ${idea}` ? { ...item, message: `Completed: ${title}`, status: 'complete' } : item
+              )
+            );
+          } else {
+            setGenerationProgress(prev => [...prev, { message: progressMessage, status: 'info' }]);
+          }
+        } else if (line.startsWith('GOOGLE_SHEETS:')) {
+          console.log('Received Google Sheets data:', line);
+          const googleSheetsData = JSON.parse(line.slice(14));
+          setGenerationProgress(prev => [
+            ...prev,
+            { message: googleSheetsData.message, status: 'complete' },
+            { message: `<a href="${googleSheetsData.url}" target="_blank" rel="noopener noreferrer">Open Google Sheets</a>`, status: 'complete', isHtml: true }
+          ]);
+        } else if (line.startsWith('ERROR:')) {
+          console.error('Received error:', line);
+          const errorMessage = line.slice(6);
+          setGenerationProgress(prev => [...prev, { message: `Error: ${errorMessage}`, status: 'error' }]);
+        }
+      }
+    }
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    const reader = new FileReader();
+
+    reader.onload = async (e) => {
+      const base64 = e.target.result;
+      const formData = new FormData();
+      formData.append('file', base64);
+      formData.append('exportFormat', 'excel'); // or whatever format you're using
+
+      // Send formData to the server
+      const response = await fetch('/api/process-excel', {
+        method: 'POST',
+        body: formData
+      });
+
+      // Handle the response
+    };
+
+    reader.readAsDataURL(file);
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -226,16 +379,36 @@ export default function Home() {
               </TabsContent>
             </Tabs>
 
-            <Button
-              onClick={handleUpload}
-              disabled={isUploading}
-              className="w-full mt-4"
-            >
-              {isUploading ? 'Processing...' : 'Process Content'}
-              <Upload className="w-4 h-4 ml-2" />
-            </Button>
+            <div className="mt-4 space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="export-format">Export Format</Label>
+                <Select value={exportFormat} onValueChange={setExportFormat}>
+                  <SelectTrigger id="export-format">
+                    <SelectValue placeholder="Select export format" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="excel">Excel (.xlsx)</SelectItem>
+                    <SelectItem value="google-sheets">Google Sheets</SelectItem>
+                    <SelectItem value="csv">CSV</SelectItem>
+                    <SelectItem value="markdown">Markdown</SelectItem>
+                    <SelectItem value="json">JSON</SelectItem>
+                    <SelectItem value="pdf">PDF</SelectItem>
+                    <SelectItem value="zip">Zip (All formats)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
 
-            <ProgressDisplay isProcessing={isUploading} progressSteps={generationProgress} />
+              <Button
+                onClick={handleUpload}
+                disabled={isUploading}
+                className="w-full"
+              >
+                {isUploading ? 'Processing...' : 'Process Content'}
+                <Upload className="w-4 h-4 ml-2" />
+              </Button>
+            </div>
+
+            <ProgressDisplay isProcessing={isProcessing} generationProgress={generationProgress} onCancel={handleCancel} />
 
             {error && (
               <p className="mt-2 text-sm text-red-500">{error}</p>

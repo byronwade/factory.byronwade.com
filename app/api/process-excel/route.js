@@ -3,6 +3,7 @@
 import { NextResponse } from 'next/server';
 import { OpenAI } from 'openai';
 import ExcelJS from 'exceljs';
+import path from 'path';
 
 if (!process.env.OPENAI_API_KEY) {
   throw new Error('Missing OPENAI_API_KEY environment variable');
@@ -49,16 +50,30 @@ function cleanAndParseJSON(content) {
   }
 }
 
-async function processBatch(ideas, batchSize = 5, writeProgress) {
+async function processBatch(ideas, batchSize = 5, writeProgress, checkCancellation) {
   const results = [];
+  const totalIdeas = ideas.length;
+  let completedIdeas = 0;
+
   for (let i = 0; i < ideas.length; i += batchSize) {
     const batch = ideas.slice(i, i + batchSize);
-    const batchResults = await Promise.all(batch.map(({ idea, link }) => generateBlogPost(idea, link)));
-    results.push(...batchResults);
-    if (writeProgress) {
-      await writeProgress(`Processed ${Math.min(i + batchSize, ideas.length)} of ${ideas.length} ideas`);
+    await writeProgress(`BATCH_START:${i + 1}:${Math.min(i + batchSize, ideas.length)}`);
+    
+    for (const { idea, link } of batch) {
+      if (await checkCancellation()) {
+        throw new Error('Process cancelled');
+      }
+      await writeProgress(`PROCESSING:${idea}`);
+      const result = await generateBlogPost(idea, link, checkCancellation);
+      completedIdeas++;
+      await writeProgress(`COMPLETED:${idea}:${result.title}`);
+      results.push(result);
+      
+      // Add a small delay to simulate processing time
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
+  
   return results;
 }
 
@@ -68,23 +83,85 @@ export async function POST(req) {
   const writer = stream.writable.getWriter();
 
   const writeProgress = async (message) => {
+    console.log('Sending progress:', message);
     await writer.write(encoder.encode(`PROGRESS:${message}\n`));
+  };
+
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000';
+
+  // Reset the cancellation flag
+  await fetch(`${baseUrl}/api/cancel-process`, { method: 'PUT' });
+
+  const checkCancellation = async () => {
+    const response = await fetch(`${baseUrl}/api/cancel-process`);
+    const data = await response.json();
+    if (data.isCancelled) {
+      await writeProgress('CANCELLED');
+      await writer.write(encoder.encode(`RESET\n`));
+      return true;
+    }
+    return false;
   };
 
   (async () => {
     try {
+      console.log('Processing started');
       const formData = await req.formData();
+      console.log('Form data received');
       const file = formData.get('file');
+      console.log('File object:', file);
+      console.log('File type:', typeof file);
+      console.log('File instanceof Blob:', file instanceof Blob);
+      console.log('File instanceof File:', file instanceof File);
+
+      if (typeof file === 'object') {
+        console.log('File object properties:', Object.getOwnPropertyNames(file));
+        console.log('File object prototype:', Object.getPrototypeOf(file));
+      }
 
       if (!file) {
         throw new Error('No file uploaded');
       }
 
-      await writeProgress('File received, processing...');
+      let buffer;
+      if (file instanceof Blob) {
+        buffer = await file.arrayBuffer();
+      } else if (typeof file === 'string') {
+        console.log('File content preview:', file.substring(0, 100));
+        if (file.startsWith('data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,')) {
+          const base64Data = file.split(',')[1];
+          buffer = Buffer.from(base64Data, 'base64');
+        } else {
+          buffer = Buffer.from(file, 'binary');
+        }
+      } else if (typeof file === 'object') {
+        if (file.arrayBuffer) {
+          buffer = await file.arrayBuffer();
+        } else if (file.buffer) {
+          buffer = file.buffer;
+        } else {
+          console.log('File object keys:', Object.keys(file));
+          throw new Error('Unsupported file object format');
+        }
+      } else {
+        throw new Error(`Unsupported file format: ${typeof file}`);
+      }
 
-      const buffer = await file.arrayBuffer();
+      if (!buffer || buffer.length === 0) {
+        throw new Error('File buffer is empty or undefined');
+      }
+
+      console.log('Buffer length:', buffer.length);
+
       const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.load(buffer);
+      try {
+        await workbook.xlsx.load(buffer);
+      } catch (error) {
+        console.error('Error loading Excel file:', error);
+        throw new Error(`Failed to load Excel file: ${error.message}. Please ensure you are uploading a valid .xlsx file.`);
+      }
+
+      await writeProgress('Excel file loaded (10%)');
 
       const worksheet = workbook.getWorksheet(1);
       const ideas = [];
@@ -98,41 +175,97 @@ export async function POST(req) {
         }
       });
 
-      await writeProgress(`Extracted ${ideas.length} ideas from the Excel file`);
+      console.log(`Extracted ${ideas.length} ideas from the Excel file`);
 
-      const results = await processBatch(ideas, 5, writeProgress);
+      const results = await processBatch(ideas, 5, writeProgress, checkCancellation);
 
-      const outputWorkbook = new ExcelJS.Workbook();
-      const outputWorksheet = outputWorkbook.addWorksheet('Blog Posts');
+      if (await checkCancellation()) return;
 
-      outputWorksheet.columns = [
-        { header: 'Title', key: 'title', width: 30 },
-        { header: 'Date', key: 'date', width: 15 },
-        { header: 'Slug', key: 'slug', width: 30 },
-        { header: 'Content', key: 'content', width: 100 },
-        { header: 'Cost ($)', key: 'cost', width: 15 },
-      ];
+      console.log('Blog posts generated');
 
-      results.forEach((blogPost) => {
-        outputWorksheet.addRow(blogPost);
-      });
+      await writeProgress('Blog posts generated (90%)');
 
-      await writeProgress('Creating output Excel file...');
+      let outputData;
+      let filename;
+      let mimeType;
 
-      const bufferOutput = await outputWorkbook.xlsx.writeBuffer();
+      const exportFormat = formData.get('exportFormat');
 
-      await writeProgress('Excel file created, preparing download...');
+      console.log(`Exporting to ${exportFormat}`);
 
-      const jsonResponse = {
-        file: Buffer.from(bufferOutput).toString('base64'),
-        filename: "generated_blog_posts.xlsx"
-      };
+      switch (exportFormat) {
+        case 'excel':
+          outputData = await generateExcelOutput(results);
+          filename = "generated_blog_posts.xlsx";
+          mimeType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+          break;
+        case 'csv':
+          outputData = generateCSVOutput(results);
+          filename = "generated_blog_posts.csv";
+          mimeType = "text/csv";
+          break;
+        case 'markdown':
+          outputData = generateMarkdownOutput(results);
+          filename = "generated_blog_posts.md";
+          mimeType = "text/markdown";
+          break;
+        case 'json':
+          outputData = JSON.stringify(results, null, 2);
+          filename = "generated_blog_posts.json";
+          mimeType = "application/json";
+          break;
+        case 'pdf':
+          outputData = await generatePDFOutput(results);
+          filename = "generated_blog_posts.pdf";
+          mimeType = "application/pdf";
+          break;
+        case 'google-sheets':
+          const { spreadsheetId, sheetUrl } = await exportToGoogleSheets(buffer);
+          console.log('Google Sheets export completed');
+          await writeProgress('Google Sheets created, preparing link... (95%)');
+          const googleSheetsResponse = {
+            url: sheetUrl,
+            message: 'Google Sheets document created successfully. Click the link below to open it:'
+          };
+          console.log('Google Sheets response:', googleSheetsResponse);
+          await writer.write(encoder.encode(`GOOGLE_SHEETS:${JSON.stringify(googleSheetsResponse)}\n`));
+          await writeProgress('Process completed (100%)');
+          return;
+        default:
+          throw new Error('Unsupported export format');
+      }
 
-      await writer.write(encoder.encode(`${JSON.stringify(jsonResponse)}\n`));
-      await writer.close();
+      if (exportFormat !== 'google-sheets') {
+        await writeProgress(`${exportFormat.toUpperCase()} file created, preparing download... (95%)`);
+        const jsonResponse = {
+          file: Buffer.from(outputData).toString('base64'),
+          filename: filename,
+          mimeType: mimeType
+        };
+        await writer.write(encoder.encode(`DATA:${JSON.stringify(jsonResponse)}\n`));
+      }
+
+      console.log('Process completed');
+      await writeProgress('Process completed (100%)');
     } catch (error) {
-      console.error('Error processing Excel file:', error);
-      await writer.write(encoder.encode(`ERROR:${error.message}\n`));
+      console.error('Error processing file:', error);
+      let errorMessage = error.message;
+      if (error.code === 'ENOENT' && error.path && error.path.includes('google-credentials.json')) {
+        errorMessage = 'Google credentials file not found. Please check your GOOGLE_APPLICATION_CREDENTIALS environment variable.';
+      } else if (error.message.includes('is this a zip file ?') || error.message.includes('Failed to load Excel file')) {
+        errorMessage = 'The uploaded file is not a valid Excel file. Please ensure you are uploading a valid .xlsx file.';
+      } else if (error.code === 'ERR_INVALID_ARG_TYPE') {
+        errorMessage = 'Invalid file data received. Please try uploading the file again.';
+      } else if (error.message.includes('Google Sheets API')) {
+        errorMessage = 'Error accessing Google Sheets API. Please check your credentials and permissions.';
+      } else if (error.message.includes('Invalid file format') || error.message.includes('Unsupported file format')) {
+        errorMessage = `${error.message}. Please upload a valid Excel (.xlsx) file.`;
+      } else {
+        errorMessage = `An unexpected error occurred: ${error.message}. Please try again.`;
+      }
+      console.error('Sending error message:', errorMessage);
+      await writer.write(encoder.encode(`ERROR:${errorMessage}\n`));
+    } finally {
       await writer.close();
     }
   })();
@@ -142,184 +275,29 @@ export async function POST(req) {
   });
 }
 
-async function generateBlogPost(idea, link) {
-  try {
-    const outline = await generateOutline(idea, link);
-    const sections = await Promise.all(outline.sections.map(section => generateSection(section, idea, link)));
-    const sources = await generateSources(idea, link);
+async function generateBlogPost(idea, link, checkCancellation) {
+  if (await checkCancellation()) throw new Error('Process cancelled');
 
-    // Remove "Section" prefix from headings
-    const cleanedSections = sections.map(section => {
-      const heading = section.content.split('\n')[0];
-      const cleanedHeading = heading.replace(/^#+\s*(?:Section\s*\d+:\s*)?/i, '');
-      const content = section.content.replace(heading, `## ${cleanedHeading}`);
-      return { ...section, content };
-    });
+  // Mock data for testing
+  const mockContent = `This is a mock blog post about "${idea}". It contains some sample content for testing purposes. The reference link is: ${link}`;
+  const mockSources = [{ name: "Mock Source", link: "https://example.com" }];
+  const mockTotalTokens = 100;
 
-    const content = cleanedSections.map(section => section.content).join('\n\n');
-    
-    // Remove null links
-    const cleanedContent = content.replace(/\[([^\]]+)\]\(null\)/g, '$1');
-
-    const totalTokens = sections.reduce((sum, section) => sum + section.tokens, 0);
-
-    const blogPost = {
-      title: outline.title,
-      date: new Date().toISOString().split('T')[0],
-      slug: generateSlug(outline.title),
-      content: cleanedContent,
-      sources: sources,
-      cost: calculateCost(totalTokens, totalTokens)
-    };
-
-    return blogPost;
-  } catch (error) {
-    console.error('Error generating blog post:', error);
-    return {
-      title: `Error: ${idea}`,
-      date: new Date().toISOString().split('T')[0],
-      slug: generateSlug(`Error for ${idea}`),
-      content: `Failed to generate content. Error: ${error.message}`,
-      sources: [],
-      cost: 0.01  // Minimum cost for failed generations
-    };
-  }
+  return {
+    title: idea,
+    content: mockContent,
+    sources: mockSources,
+    slug: generateSlug(idea),
+    date: new Date().toISOString().split('T')[0],
+    cost: calculateCost(mockTotalTokens, mockTotalTokens)
+  };
 }
 
-async function generateOutline(idea, link) {
-  const outlinePrompt = `
-Create a detailed outline for a 2,000-3,000 word blog post on the following topic:
-"${idea}"
-
-Reference link for additional information: ${link}
-
-Provide the outline in the following JSON format:
-{
-  "title": "SEO-optimized blog post title",
-  "sections": [
-    {"heading": "Introduction", "subheadings": []},
-    {"heading": "Section 1", "subheadings": []},
-    {"heading": "Section 2", "subheadings": []},
-    {"heading": "Section 3", "subheadings": []},
-    {"heading": "Conclusion", "subheadings": []}
-  ]}`;
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4',
-      messages: [{ role: 'user', content: outlinePrompt }],
-      max_tokens: 1000,
-      temperature: 0.7,
-    });
-
-    const content = completion.choices[0].message.content;
-    console.log('Raw outline response:', content);
-    const parsedOutline = cleanAndParseJSON(content);    
-
-    if (parsedOutline && parsedOutline.title && Array.isArray(parsedOutline.sections)) {
-      return parsedOutline;
-    } else {
-      throw new Error('Invalid outline format');
-    }
-  } catch (error) {
-    console.error('Error generating outline:', error);
-    return {
-      title: `${idea}`,
-      sections: [
-        { heading: "Introduction", subheadings: [] },
-        { heading: "Section 1", subheadings: [] },
-        { heading: "Section 2", subheadings: [] },
-        { heading: "Section 3", subheadings: [] },
-        { heading: "Conclusion", subheadings: [] }
-      ]
-    };
-  }
-}
-
-async function generateSections(outline, idea) {
-  const sectionPrompts = outline.sections.map(section => ({
-    heading: section.heading,
-    prompt: `Write a detailed section for a blog post about "${idea}":
-Heading: ${section.heading}
-Subheadings: ${section.subheadings.join(', ')}
-Provide at least 200 words of content for this section.`
-  }));
-
-  const sectionResults = await Promise.all(sectionPrompts.map(generateSection));
-  return sectionResults;
-}
-
-async function generateSection(sectionPrompt, idea, link, retries = 3) {
-  const isIntroduction = sectionPrompt.heading === "Introduction";
-  const isConclusion = sectionPrompt.heading === "Conclusion";
-  const prompt = `Write a detailed ${sectionPrompt.heading.toLowerCase()} for a blog post about "${idea}". 
-  ${isIntroduction ? "Include context and a clear thesis statement." : ""}
-  ${isConclusion ? "Summarize the main points and provide a call to action or final thoughts." : ""}
-  Aim for at least ${isIntroduction || isConclusion ? "150" : "300"} words. 
-  Integrate relevant links using markdown format. 
-  Reference link for additional information: ${link}`;
-
-  while (retries > 0) {
-    try {
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 1500,
-        temperature: 0.7,
-      });
-
-      const content = completion.choices[0].message.content;
-      const wordCount = content.split(/\s+/).length;
-
-      if ((isIntroduction && wordCount >= 150) || (isConclusion && wordCount >= 150) || (!isIntroduction && !isConclusion && wordCount >= 300)) {
-        return { content: `${content}`, tokens: completion.usage.total_tokens };
-      }
-
-      console.log(`Retry for section ${sectionPrompt.heading}: Word count (${wordCount}) too low.`);
-      retries--;
-    } catch (error) {
-      console.error(`Error generating section ${sectionPrompt.heading}:`, error);
-      retries--;
-    }
-  }
-
-  // If all retries fail, return a default content
-  const defaultContent = `[Content generation failed for the ${sectionPrompt.heading.toLowerCase()}. Please replace this with your own content of at least ${isIntroduction || isConclusion ? "150" : "300"} words.]`;
-  
-  return { content: defaultContent, tokens: defaultContent.split(/\s+/).length };
-}
-
-async function generateSources(idea, link) {
-  const sourcesPrompt = `Provide a list of 3-5 reputable sources for a blog post about "${idea}".
-  Reference link for additional information: ${link}
-  Return the sources in the following JSON format:
-  [{"name": "Source Name", "link": "https://source-link.com"}]`;
-
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4',
-      messages: [{ role: 'user', content: sourcesPrompt }],
-      max_tokens: 500,
-      temperature: 0.7,
-    });
-
-    const content = completion.choices[0].message.content;
-    console.log('Raw sources response:', content);
-    const parsedSources = cleanAndParseJSON(content);    
-
-    if (parsedSources && Array.isArray(parsedSources)) {
-      return parsedSources;
-    } else {
-      console.error('Invalid sources format:', parsedSources);
-      // If parsing fails, try to extract URLs from the content
-      const urls = content.match(/https?:\/\/[^\s]+/g) || [];
-      return urls.map(url => ({ name: "Source", link: url }));
-    }
-  } catch (error) {
-    console.error('Error generating sources:', error);
-    return []; // Return an empty array on error
-  }
-}
+// Comment out the following functions
+// async function generateOutline(idea, link, checkCancellation) { ... }
+// async function generateSections(outline, idea, link, checkCancellation) { ... }
+// async function generateSection(sectionPrompt, idea, link, checkCancellation, retries = 3) { ... }
+// async function generateSources(idea, link, checkCancellation) { ... }
 
 function generateSlug(title) {
   return title
@@ -328,4 +306,113 @@ function generateSlug(title) {
     .replace(/[^\w\s-]/g, '')
     .replace(/\s+/g, '-')
     .replace(/--+/g, '-');
+}
+
+async function generateExcelOutput(results) {
+  const outputWorkbook = new ExcelJS.Workbook();
+  const outputWorksheet = outputWorkbook.addWorksheet('Blog Posts');
+
+  outputWorksheet.columns = [
+    { header: 'Title', key: 'title', width: 30 },
+    { header: 'Date', key: 'date', width: 15 },
+    { header: 'Slug', key: 'slug', width: 30 },
+    { header: 'Content', key: 'content', width: 100 },
+    { header: 'Cost ($)', key: 'cost', width: 15 },
+  ];
+
+  results.forEach((blogPost) => {
+    outputWorksheet.addRow(blogPost);
+  });
+
+  return await outputWorkbook.xlsx.writeBuffer();
+}
+
+function generateCSVOutput(results) {
+  const header = "Title,Date,Slug,Content,Cost ($)\n";
+  const rows = results.map(post => 
+    `"${post.title}","${post.date}","${post.slug}","${post.content.replace(/"/g, '""')}","${post.cost}"`
+  ).join("\n");
+  return header + rows;
+}
+
+function generateMarkdownOutput(results) {
+  return results.map(post => `
+# ${post.title}
+
+Date: ${post.date}
+Slug: ${post.slug}
+
+${post.content}
+
+Cost: $${post.cost}
+`).join("\n\n---\n\n");
+}
+
+async function generatePDFOutput(results) {
+  const { jsPDF } = await import('jspdf');
+  const doc = new jsPDF();
+  
+  results.forEach((post, index) => {
+    if (index > 0) doc.addPage();
+    doc.setFontSize(18);
+    doc.text(post.title, 10, 20);
+    doc.setFontSize(12);
+    doc.text(doc.splitTextToSize(post.content, 180), 10, 30);
+  });
+  
+  return doc.output('arraybuffer');
+}
+
+async function exportToGoogleSheets(buffer) {
+  const { google } = require('googleapis');
+  const { authenticate } = require('@google-cloud/local-auth');
+
+  const SCOPES = ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/spreadsheets'];
+
+  try {
+    // Authenticate
+    const auth = await authenticate({
+      keyfilePath: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      scopes: SCOPES,
+    });
+
+    const drive = google.drive({ version: 'v3', auth });
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    // Upload the Excel file to Google Drive
+    const fileMetadata = {
+      name: 'Converted Excel File',
+      mimeType: 'application/vnd.google-apps.spreadsheet',
+    };
+    const media = {
+      mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      body: buffer,
+    };
+
+    const file = await drive.files.create({
+      resource: fileMetadata,
+      media: media,
+      fields: 'id',
+    });
+
+    const spreadsheetId = file.data.id;
+    const sheetUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+    // Set the spreadsheet to be publicly accessible
+    await drive.permissions.create({
+      fileId: spreadsheetId,
+      requestBody: {
+        role: 'reader',
+        type: 'anyone',
+      },
+    });
+
+    console.log('Spreadsheet created with ID:', spreadsheetId);
+    console.log('Sheet URL:', sheetUrl);
+
+    return { spreadsheetId, sheetUrl };
+  } catch (error) {
+    console.error('Error in exportToGoogleSheets:', error);
+    throw error;
+  }
 }
